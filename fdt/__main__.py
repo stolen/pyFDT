@@ -71,7 +71,7 @@ def pack(in_file: str, out_file: str, version: int, lc_version: int, cpu_id: int
         raise Exception("DTB Version must be lover or equal {} !".format(fdt.Header.MAX_VERSION))
 
     fdt_obj = parse_fdt(in_file, 'dts')
-    if update_phandles:
+    if update_phandles and fdt_obj.overlay is None:
         fdt_obj.update_phandles()
     raw_data = fdt_obj.to_dtb(version, lc_version, cpu_id)
 

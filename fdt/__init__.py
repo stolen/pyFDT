@@ -15,8 +15,10 @@
 import os
 
 from .header import Header, DTB_BEGIN_NODE, DTB_END_NODE, DTB_PROP, DTB_END, DTB_NOP
-from .items import new_property, Property, PropBytes, PropWords, PropStrings, PropIncBin, Node
+from .items import new_property, Property, PropBytes, PropWords, PropStrings, PropIncBin, Node, Ref
 from .misc import strip_comments, split_to_lines, get_version_info, extract_string
+from . import overlay as _overlay
+from .overlay import Overlay, Fragment, finalize
 
 __author__  = "Martin Olejar"
 __contact__ = "martin.olejar@gmail.com"
@@ -34,6 +36,12 @@ __all__     = [
     'PropWords',
     'PropStrings',
     'PropIncBin',
+    # references
+    'Ref',
+    # overlay model
+    'Overlay',
+    'Fragment',
+    'finalize',
     # core methods
     'parse_dts',
     'parse_dtb',
@@ -60,18 +68,21 @@ class FDT:
     def empty(self):
         return self.root.empty
 
-    def __init__(self, header=None, entries=[]):
+    def __init__(self, header=None, entries=None):
         """
         FDT class constructor
 
         :param header:
+        :param entries:
         """
-        self.entries = entries
+        self.entries = [] if entries is None else entries
         self.header = Header() if header is None else header
         self.root = Node('/')
         self.last_handle = 0
         self.label_to_handle = {}
         self.handle_to_label = {}
+        # Set for device tree overlays; ``None`` for a base tree.
+        self.overlay = None
 
 
     def __str__(self):
@@ -314,6 +325,8 @@ class FDT:
         :param tabsize:
         """
         result = "/dts-v1/;\n"
+        if self.overlay is not None:
+            result += "/plugin/;\n"
         if self.header.version is not None:
             result += "// version: {}\n".format(self.header.version)
             result += "// last_comp_version: {}\n".format(self.header.last_comp_version)
@@ -327,7 +340,14 @@ class FDT:
                 result += "{:#x}".format(entry['size']) if entry['size'] else "0"
                 result += ";\n"
         if self.root is not None:
-            result += self.root.to_dts(tabsize)
+            if self.overlay is not None:
+                sugar = _overlay.render_sugar(self, tabsize)
+                if sugar is not None:
+                    result += sugar
+                else:
+                    result += _overlay.project(self).to_dts(tabsize)
+            else:
+                result += self.root.to_dts(tabsize)
         return result
 
     def to_dtb(self, version: int = None, last_comp_version: int = None, boot_cpuid_phys: int = None, strings: str = None, padding: int = 0) -> bytes:
@@ -385,7 +405,8 @@ class FDT:
                 blob_entries += pack('>QQ', entry['address'], entry['size'])
         blob_entries += pack('>QQ', 0, 0)
         blob_data_start = self.header.size + len(blob_entries)
-        (blob_data, blob_strings, data_pos) = self.root.to_dtb(strings, blob_data_start, self.header.version)
+        root = _overlay.project(self) if self.overlay is not None else self.root
+        (blob_data, blob_strings, data_pos) = root.to_dtb(strings, blob_data_start, self.header.version)
         blob_data += pack('>I', DTB_END)
         self.header.size_dt_strings = len(blob_strings)
         self.header.size_dt_struct = len(blob_data)
@@ -401,144 +422,13 @@ def parse_dts(text: str, root_dir: str = '') -> FDT:
     """
     Parse DTS text file and create FDT Object
 
-    :param text:
-    :param root_dir: 
+    :param text: DTS source text
+    :param root_dir: Base directory used to resolve /incbin/ paths
     """
-    ver = get_version_info(text)
-    text = strip_comments(text)
-    dts_lines = split_to_lines(text)
+    from .parser import parse_into
+
     fdt_obj = FDT()
-    if 'version' in ver:
-        fdt_obj.header.version = ver['version']
-    if 'last_comp_version' in ver:
-        fdt_obj.header.last_comp_version = ver['last_comp_version']
-    if 'boot_cpuid_phys' in ver:
-        fdt_obj.header.boot_cpuid_phys = ver['boot_cpuid_phys']
-    # parse entries
-    fdt_obj.entries = []
-    for line in dts_lines:
-        if line.endswith('{'):
-            break
-        if line.startswith('/memreserve/'):
-            line = line.strip(';')
-            line = line.split()
-            if len(line) != 3 :
-                raise Exception()
-            fdt_obj.entries.append({'address': int(line[1], 0), 'size': int(line[2], 0)})
-    # parse nodes
-    curnode = None
-    fdt_obj.root = None
-    for line in dts_lines:
-        if line.endswith('{'):
-            # start node
-            if ':' in line:  #indicates the present of a label
-                label, rest = line.split(':')
-                node_name = rest.split()[0]
-                new_node = Node(node_name)
-                new_node.set_label(label)
-
-                
-            else:
-                node_name = line.split()[0]
-                new_node = Node(node_name)
-            if fdt_obj.root is None:
-                fdt_obj.root = new_node
-            if curnode is not None:
-                curnode.append(new_node)
-            curnode = new_node
-        elif line.endswith('}'):
-            # end node
-            if curnode is not None:
-                if curnode.get_property('phandle') is None:
-                    if curnode.label is not None:
-                        handle = fdt_obj.add_label(curnode.label)
-                        curnode.set_property('phandle', handle)
-                curnode = curnode.parent
-        else:
-            # properties
-            if line.find('=') == -1:
-                prop_name = line
-                prop_obj = Property(prop_name)
-            else:
-                line = line.split('=', maxsplit=1)
-                prop_name = line[0].rstrip(' ')
-                prop_value = line[1].lstrip(' ')
-                if prop_value.startswith('<'):
-                    prop_obj = PropWords(prop_name)
-                    prop_value = prop_value.replace('<', '').replace('>', '')
-                    # ['interrupts ' = ' <0 5 4>, <0 6 4>']
-                    # just change ',' to ' ' -- to concatenate the values into single array
-                    if ',' in prop_value:
-                        prop_value = prop_value.replace(',', ' ')
-                    
-                    # keep the orginal references for phandles as a phantom
-                    # property
-                    if "&" in prop_value:
-                        phantom_obj = PropStrings(prop_name+'_with_references')
-                        phantom_obj.append(line[1].lstrip(' '))
-                        if curnode is not None:
-                            curnode.append(phantom_obj)
-                    for prop in prop_value.split():
-                        if prop.startswith('0x'):
-                            prop_obj.append(int(prop, 16))
-                        elif prop.startswith('0b'):
-                            prop_obj.append(int(prop, 2))
-                        elif prop.startswith('0'):
-                            prop_obj.append(int(prop, 8))
-                        elif prop.startswith('&'):
-                            prop_obj.append(fdt_obj.add_label(prop[1:]))
-                        else:
-                            prop_obj.append(int(prop))
-                elif prop_value.startswith('['):
-                    prop_obj = PropBytes(prop_name)
-                    prop_value = prop_value.replace('[', '').replace(']', '')
-                    for prop in prop_value.split():
-                        prop_obj.append(int(prop, 16))
-                elif prop_value.startswith('/incbin/'):
-                    prop_value = prop_value.replace('/incbin/("', '').replace('")', '')
-                    prop_value = prop_value.split(',')
-                    file_path  = os.path.join(root_dir, prop_value[0].strip())
-                    file_offset = int(prop_value.strip(), 0) if len(prop_value) > 1 else 0
-                    file_size = int(prop_value.strip(), 0) if len(prop_value) > 2 else 0
-                    if file_path is None or not os.path.exists(file_path):
-                        raise Exception("File path doesn't exist: {}".format(file_path))
-                    with open(file_path, "rb") as f:
-                        f.seek(file_offset)
-                        prop_data = f.read(file_size) if file_size > 0 else f.read()
-                    prop_obj = PropIncBin(prop_name, prop_data, os.path.split(file_path)[1])
-                elif prop_value.startswith('/plugin/'):
-                    raise NotImplementedError("Not implemented property value: /plugin/")
-                elif prop_value.startswith('/bits/'):
-                    raise NotImplementedError("Not implemented property value: /bits/")
-                else:
-                    prop_obj = PropStrings(prop_name)
-                    expect_open = True
-                    in_prop = False
-                    prop = ''
-                    for c in prop_value:
-                        if c == '"' and not in_prop and expect_open:
-                            prop = ''
-                            in_prop = True
-                        elif c == '"' and in_prop:
-                            if not len(prop) > 0:
-                                raise ValueError('Empty string')
-                            prop_obj.append(prop)
-                            in_prop = False
-                            expect_open = False
-                        elif in_prop:
-                            prop += c
-                        elif c == ',' and not expect_open:
-                            expect_open = True
-                        elif c == ' ':
-                            continue
-                        else:
-                            raise ValueError(f'Invalid char: {c}')
-
-                    if expect_open:
-                        raise ValueError('Expected string after ,')
-            if curnode is not None:
-                curnode.append(prop_obj)
-
+    parse_into(fdt_obj, text, root_dir)
     return fdt_obj
 
 
@@ -601,6 +491,9 @@ def parse_dtb(data: bytes, offset: int = 0) -> FDT:
             break
         else:
             raise Exception("Unknown Tag: {}".format(tag))
+
+    if _overlay.detect(fdt_obj.root):
+        fdt_obj.overlay = _overlay.from_tree(fdt_obj)
 
     return fdt_obj
 

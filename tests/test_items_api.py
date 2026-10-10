@@ -220,3 +220,53 @@ def test_node_set_property():
 
     # validate property value
     assert root_node.get_property('list_int_prop').data == [1, 2, 3]
+
+
+def test_node_get_node_path():
+    root = fdt.Node('/')
+
+    with pytest.raises(ValueError):
+        root.get_node('a/b')
+
+    node = root.get_node('a/b', create=True)
+
+    assert node.name == 'b'
+    assert root.get_node('a/b') is node
+    assert root.get_subnode('a').get_subnode('b') is node
+
+    with pytest.raises(AssertionError):
+        root.get_node(5)
+
+
+def test_node_set_property_accepts_references():
+    node = fdt.Node('/')
+
+    node.set_property('refs', [fdt.Ref(label='gpio3'), 4, 0])
+    prop = node.get_property('refs')
+
+    assert isinstance(prop, fdt.PropWords)
+    assert isinstance(prop.data[0], fdt.Ref)
+    assert prop.data[0].label == 'gpio3'
+    assert prop.data[1:] == [4, 0]
+    assert '&gpio3' in prop.to_dts()
+
+    # replacing keeps the property's position and swaps the reference
+    node.set_property('other', 1)
+    node.set_property('refs', [fdt.Ref(label='saradc'), 3])
+
+    assert node.props.index(node.get_property('refs')) == 0
+    assert node.get_property('refs').data[0].label == 'saradc'
+
+
+def test_node_set_property_accepts_property_instance():
+    node = fdt.Node('/')
+    source = fdt.PropWords('cells', fdt.Ref(label='gpio3'), 1)
+
+    node.set_property('reset-gpios', source)
+    prop = node.get_property('reset-gpios')
+
+    assert prop.name == 'reset-gpios'
+    assert isinstance(prop.data[0], fdt.Ref)
+    assert prop.data[1] == 1
+    # the passed property object is copied, not aliased or renamed
+    assert source.name == 'cells'

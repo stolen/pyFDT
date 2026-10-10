@@ -112,6 +112,44 @@ for manipulation with FDT Nodes, Properties and dts/dtb files are already implem
   print(out[2]) # specific for dt2
 ```
 
+## Device Tree Overlays
+
+The module understands device tree overlays (`/plugin/`), including the
+root-level reference sugar (`&label { ... }` / `&{/path} { ... }`) and symbolic
+references (`<&label ...>`, `&{/path}`). An overlay is exposed as an ordered list
+of fragments on the parsed object; the `fragment@N` / `__symbols__` /
+`__fixups__` / `__local_fixups__` machinery exists only as the `.dtbo`
+projection.
+
+```python
+  import fdt
+
+  # Parse overlay source
+  dt = fdt.parse_dts(open("overlay.dts").read())
+  dt.overlay.fragments            # [Fragment(target=&i2c8, body=...)]
+
+  # Compile to a .dtbo (byte-identical to `dtc -@`)
+  blob = dt.to_dtb()
+
+  # Decompile a .dtbo back to plugin sugar
+  dt2 = fdt.parse_dtb(blob)
+  print(dt2.to_dts())             # /plugin/;  &i2c8 { ... };
+```
+
+Overlay detection is structural: a tree is an overlay when its root has a
+`fragment@N` node containing an `__overlay__`. Decompilation strips the fragment
+and fixup machinery and reconstructs `&label` sugar; when an overlay cannot be
+represented as sugar (root-level properties, non-contiguous fragment indices, or
+extra fragment properties) the explicit fragment form is emitted instead.
+
+Compilation always emits `__symbols__` for labelled nodes (like `dtc -@`), so a
+compiled overlay is byte-identical to `dtc -@`; an overlay with no labelled nodes
+produces no `__symbols__` node.
+
+Preprocessing is external, matching `dtc`: `parse_dts` ignores cpp line markers
+and reports a clear error on an unresolved `#include` or macro, so preprocess the
+source with `cpp` first when it uses `#include` / macros.
+
 ## [ pydtc ] Tool
 
 The python device tree converter **pydtc** is a tool for conversion *.dts to *.dtb and vice versa. Is distributed

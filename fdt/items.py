@@ -20,6 +20,51 @@ from .misc import is_string, line_offset
 
 BIGENDIAN_WORD = Struct(">I")
 
+UNRESOLVED_PHANDLE = 0xFFFFFFFF
+
+
+########################################################################################################################
+# Reference
+########################################################################################################################
+
+class Ref:
+    """A symbolic device tree reference (``&label`` or ``&{/path}``).
+
+    A reference is stored directly as a cell value of a :class:`PropWords`, so
+    there is no parallel side-table to keep in sync.  ``value`` is the resolved
+    phandle (``0xFFFFFFFF`` when the reference is external / unresolved).
+    """
+
+    __slots__ = ("label", "path", "value")
+
+    def __init__(self, label=None, path=None, value=None):
+        self.label = label
+        self.path = path
+        self.value = value
+
+    def __eq__(self, obj):
+        return (isinstance(obj, Ref) and self.label == obj.label and
+                self.path == obj.path and self.value == obj.value)
+
+    def __hash__(self):
+        return hash((self.label, self.path, self.value))
+
+    def __repr__(self):
+        return "Ref(label={!r}, path={!r}, value={!r})".format(self.label, self.path, self.value)
+
+    def copy(self):
+        return Ref(self.label, self.path, self.value)
+
+    def to_dts(self):
+        """Render the reference in DTS source form."""
+        if self.label:
+            return "&" + self.label
+        if self.path is not None:
+            return "&{" + self.path + "}"
+        value = UNRESOLVED_PHANDLE if self.value is None else self.value
+        return "0x{:X}".format(value)
+
+
 ########################################################################################################################
 # Helper methods
 ########################################################################################################################
@@ -276,14 +321,17 @@ class PropWords(Property):
 
     @property
     def value(self):
-        return self.data[0] if self.data else None
+        if not self.data:
+            return None
+        first = self.data[0]
+        return first.value if isinstance(first, Ref) else first
 
     def __init__(self, name, *args):
         """
         PropWords constructor
 
         :param name: Property name
-        :param args: word1, word2, ...
+        :param args: word1, word2, ... (integers or :class:`Ref` values)
         """
         super().__init__(name)
         self.data = []
@@ -317,9 +365,12 @@ class PropWords(Property):
         return True
 
     def copy(self):
-        return PropWords(self.name, *self.data)
+        return PropWords(self.name, *(v.copy() if isinstance(v, Ref) else v for v in self.data))
 
     def append(self, value):
+        if isinstance(value, Ref):
+            self.data.append(value)
+            return
         assert isinstance(value, int), "Invalid object type"
         assert 0 <= value < 2**self.word_size, "Invalid word value {}, use <0x0 - 0x{:X}>".format(
             value, 2**self.word_size - 1)
@@ -341,7 +392,9 @@ class PropWords(Property):
         """
         result  = line_offset(tabsize, depth, self.name)
         result += ' = <'
-        result += ' '.join(["0x{:X}".format(word) for word in self.data])
+        result += ' '.join(
+            word.to_dts() if isinstance(word, Ref) else "0x{:X}".format(word)
+            for word in self.data)
         result += ">;\n"
         return result
 
@@ -358,7 +411,11 @@ class PropWords(Property):
             strpos = len(strings)
             strings += self.name + '\0'
         blob = pack('>III', DTB_PROP, len(self.data) * 4, strpos)
-        blob += bytes().join([BIGENDIAN_WORD.pack(word) for word in self.data])
+        blob += bytes().join(
+            BIGENDIAN_WORD.pack(
+                (word.value if word.value is not None else UNRESOLVED_PHANDLE)
+                if isinstance(word, Ref) else word)
+            for word in self.data)
         pos += len(blob)
         return blob, strings, pos
 
@@ -582,13 +639,16 @@ class Node(BaseItem):
         :param name: Property name
         :param value: Property value
         """
-        if value is None:
+        if isinstance(value, Property):
+            new_prop = value.copy()
+            new_prop.set_name(name)
+        elif value is None:
             new_prop = Property(name)
         elif isinstance(value, int):
             new_prop = PropWords(name, value)
         elif isinstance(value, str):
             new_prop = PropStrings(name, value)
-        elif isinstance(value, list) and isinstance(value[0], int):
+        elif isinstance(value, list) and isinstance(value[0], (int, Ref)):
             new_prop = PropWords(name, *value)
         elif isinstance(value, list) and isinstance(value[0], str):
             new_prop = PropStrings(name, *value)
@@ -614,6 +674,27 @@ class Node(BaseItem):
             if n.name == name:
                 return n
         return None
+
+    def get_node(self, path: str, create: bool = False):
+        """
+        Get subnode by slash-separated path
+
+        :param path: Path relative to this node
+        :param create: If True, missing intermediate nodes will be created
+        """
+        assert isinstance(path, str), "Node path must be a string type !"
+
+        node = self
+        for name in [part for part in path.split('/') if part]:
+            item = node.get_subnode(name)
+            if item is None:
+                if create:
+                    item = Node(name)
+                    node.append(item)
+                else:
+                    raise ValueError("Path \"{}\" doesn't exists".format(path))
+            node = item
+        return node
 
     def exist_property(self, name: str) -> bool:
         """ 
